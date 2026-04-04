@@ -1,5 +1,8 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "nodejs", "python313"]
+nixPkgs = ["ffmpeg", "nodejs", "python313", "python313Packages.pip"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["pip3 install -r requirements.txt"]
+
+[start]
+cmd = "gunicorn run:app"
