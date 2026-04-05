@@ -89,8 +89,6 @@ AD_SKIP_SECONDS   = 15
 # after the ad skip, without downloading unused video data.
 MAX_DOWNLOAD_SECONDS = 63    # was 90
 
-NODE_PATH = r"C:\Program Files\nodejs\node.exe" if os.name == "nt" else "node"
-
 # ── Cookies path ───────────────────────────────────────────────────────────────
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "cookies.txt")
 
@@ -127,25 +125,27 @@ def _ydl_opts(extra: dict = None, cookies_file: str = None) -> dict:
         "noprogress":         True,
         "geo_bypass":         True,
         "geo_bypass_country": "US",
-        "js_runtimes":        {"node": {"path": NODE_PATH}},
-        "remote_components":  ["ejs:github"],
+        "xff":                "US",           # explicit XFF header (newer yt-dlp)
+        "extract_flat":       False,
+        "retries":            3,
+        "fragment_retries":   3,
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "web_safari", "android_vr", "tv_embedded"]
+                # "android" is the key geo-bypass client — it uses InnerTube with
+                # softer regional enforcement than the web client.
+                # Do NOT replace with android_vr — that client only serves DASH
+                # streams and does NOT bypass geo-restrictions.
+                "player_client": ["web", "tv_embedded", "android"]
             }
         },
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         },
     }
     if cookies_file:
         opts["cookiefile"] = cookies_file
-        print(f"[SAMPLER] Using cookies: {cookies_file}")
     if extra:
         opts.update(extra)
     return opts
@@ -425,19 +425,19 @@ def _sample_thumbnail_only(video_id: str, thumbnail_url: str,
 
 
 # ── Process one segment ───────────────────────────────────────────────────────
-def _process_segment(
-    video_path: str, seg_id: str, start: int, seg_dur: int = SEGMENT_DURATION
-) -> dict:
+def _process_segment(video_path: str, seg_id: str, start: int, seg_dur: int = 20) -> dict:
     t       = time.time()
     frames  = extract_frames(video_path, start, seg_dur)
     fcr     = compute_fcr(frames)
     csv     = compute_csv(frames)
     att     = compute_att(video_path, start, seg_dur)
-    score_h = round(0.35 * fcr + 0.25 * csv + 0.20 * att, 4)
-    print(f"[SAMPLER] {seg_id} FCR={fcr} | CSV={csv} | ATT={att} | "
-          f"H={score_h} ({time.time()-t:.1f}s)")
+    
+    # Apply High-Sensitivity Segment Scoring
+    multiplier = 1.25 if (fcr > 0.5 or att > 0.5) else 1.0
+    score_h = round((0.45 * fcr + 0.15 * csv + 0.30 * att) * multiplier, 4)
+    
     return {
-        "segment_id":     seg_id,
+        "segment_id": seg_id,
         "offset_seconds": start,
         "length_seconds": seg_dur,
         "fcr": fcr, "csv": csv, "att": att, "score_h": score_h,
@@ -467,21 +467,32 @@ def sample_video(video_url_or_id: str, thumbnail_url: str = "",
         print(f"\n[SAMPLER] ══════════════════════════════════════")
         print(f"[SAMPLER] Analyzing: {video_id}")
 
-        # ── Step 1: Normal download ───────────────────────────────────────────
-        t0     = time.time()
-        result = fetch_video(video_id, max_duration=MAX_DOWNLOAD_SECONDS)
-        print(f"[SAMPLER] Download: {time.time()-t0:.1f}s")
+        # ── Step 1 & 2: Download with preemptive cookies ──────────────────────
+        # Using cookies on the FIRST attempt is critical: YouTube authenticates
+        # the session upfront and serves a wider format list (including pre-muxed
+        # streams). A no-cookie first attempt negotiates a restricted format list,
+        # and a subsequent cookie retry cannot recover the format selection.
+        t0 = time.time()
+        use_cookies = COOKIES_PATH if _has_cookies() else None
 
-        # ── Step 2: Cookie retry for age-restricted ───────────────────────────
-        if not result["ok"] and "age" in result["reason"].lower():
-            if _has_cookies():
-                print(f"[SAMPLER] ⚠ Age-restricted — retrying with cookies.txt")
-                t0     = time.time()
-                result = fetch_video(video_id, max_duration=MAX_DOWNLOAD_SECONDS,
-                                     cookies_file=COOKIES_PATH)
-                print(f"[SAMPLER] Cookie download: {time.time()-t0:.1f}s")
-            else:
-                print(f"[SAMPLER] ⚠ Age-restricted — no cookies.txt found")
+        if use_cookies:
+            print("[SAMPLER] Found cookies.txt, using preemptively to bypass bot-blocks.")
+
+        result = fetch_video(video_id, max_duration=MAX_DOWNLOAD_SECONDS, cookies_file=use_cookies)
+        print(f"[SAMPLER] Download attempt 1: {time.time()-t0:.1f}s")
+
+        # Retry without cookies only for non-geo-block failures (e.g. expired cookie).
+        # For true geo-blocks ("not available"), a cookieless retry wastes ~6s and
+        # returns the same error — skip it.
+        _reason = result.get("reason", "").lower()
+        _is_geo_block = "not available" in _reason or "region" in _reason
+        if not result["ok"] and not use_cookies and _has_cookies():
+            print(f"[SAMPLER] ⚠ Failed ({result['reason']}) — retrying with cookies.txt")
+            t0 = time.time()
+            result = fetch_video(video_id, max_duration=MAX_DOWNLOAD_SECONDS, cookies_file=COOKIES_PATH)
+            print(f"[SAMPLER] Cookie retry: {time.time()-t0:.1f}s")
+        elif not result["ok"] and _is_geo_block:
+            print(f"[SAMPLER] ✗ True geo-block — skipping cookieless retry (android client + geo_bypass already tried)")
 
         # ── Step 3: Thumbnail-only fallback ───────────────────────────────────
         if not result["ok"]:
@@ -501,7 +512,8 @@ def sample_video(video_url_or_id: str, thumbnail_url: str = "",
         # ── Determine ad-skip offset ───────────────────────────────────────────
         # Disable ad-skip for short videos where skipping 15s would leave
         # too little content (Shorts, clips under 35 seconds total)
-        min_duration_for_ad_skip = AD_SKIP_SECONDS + SEGMENT_DURATION  # 35s
+
+        min_duration_for_ad_skip = AD_SKIP_SECONDS + SEGMENT_DURATION
         if actual_dur < min_duration_for_ad_skip:
             ad_skip = 0
             print(f"[SAMPLER] Short video ({actual_dur:.0f}s) — ad-skip disabled")
@@ -509,30 +521,21 @@ def sample_video(video_url_or_id: str, thumbnail_url: str = "",
             ad_skip = AD_SKIP_SECONDS
             print(f"[SAMPLER] Ad-skip: first {ad_skip}s excluded from analysis")
 
-        # ── Segment positions (all start after ad_skip) ────────────────────────
-        content_dur = actual_dur - ad_skip  # usable content duration
+        content_dur = actual_dur - ad_skip
 
+        # >>> REPLACE YOUR IF/ELSE BLOCK WITH THIS: <<<
         if content_dur <= SEGMENT_DURATION:
-            # Very short content window — use single deduplicated segment
+            # User Insight: Analyze the whole video as ONE block for better data stability.
             effective_seg_dur = max(1, int(content_dur))
-            seg_starts = [
-                ("S1", ad_skip),
-                ("S2", ad_skip),
-                ("S3", ad_skip),
-            ]
+            # We only prepare S1 here. We will duplicate it later to save CPU time.
+            seg_starts = [("S1", ad_skip)]
+            is_short_video = True
         else:
             effective_seg_dur = SEGMENT_DURATION
-            # Spread 3 segments across the content window (after ad_skip)
             mid = ad_skip + max(0, int(content_dur / 2) - effective_seg_dur // 2)
             end = ad_skip + max(0, int(content_dur) - effective_seg_dur)
-
-            seen = []
-            for v in [ad_skip, mid, end]:
-                if v not in seen:
-                    seen.append(v)
-            while len(seen) < 3:
-                seen.append(seen[-1])
-            seg_starts = list(zip(["S1", "S2", "S3"], seen))
+            seg_starts = [("S1", ad_skip), ("S2", mid), ("S3", end)]
+            is_short_video = False
 
         print(f"[SAMPLER] Segments: {[(s, o) for s, o in seg_starts]} "
               f"| seg_dur={effective_seg_dur}s | ad_skip={ad_skip}s")
@@ -557,12 +560,20 @@ def sample_video(video_url_or_id: str, thumbnail_url: str = "",
                 else:
                     segments[key] = future.result()
 
+        # >>> ADD THIS DUPLICATION LOGIC RIGHT AFTER THE THREADPOOL <<<
+        if is_short_video and segments[0] is not None:
+            # We computed the whole video perfectly once. Now clone it for the DB.
+            s1_data = segments[0]
+            segments[1] = {**s1_data, "segment_id": "S2"}
+            segments[2] = {**s1_data, "segment_id": "S3"}
+
         print(f"[SAMPLER] Analysis: {time.time()-t0:.1f}s")
 
-        max_seg   = max(s["score_h"] for s in segments)
-        agg_score = round(0.80 * max_seg + 0.20 * thumb, 4)
-        label     = ("Overstimulating" if agg_score >= 0.20
-                     else "Safe"       if agg_score <= 0.08
+        max_seg   = max(s["score_h"] for s in segments if s is not None)
+        agg_score = round(0.90 * max_seg + 0.10 * thumb, 4)
+        # Updated Label Thresholds (v2)
+        label     = ("Overstimulating" if agg_score >= 0.30
+                     else "Safe"       if agg_score <= 0.12
                      else "Neutral")
 
         total = time.time() - t_start
