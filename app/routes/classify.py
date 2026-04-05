@@ -7,13 +7,24 @@ from flask import Blueprint, jsonify, request
 from app.modules.frame_sampler import sample_video
 from app.modules.heuristic import compute_heuristic_score
 from app.modules.naive_bayes import score_from_metadata_dict, score_metadata
-from app.modules.hybrid_fusion import ALPHA, BETA, THRESHOLD_BLOCK, THRESHOLD_ALLOW
 
 classify_bp = Blueprint("classify", __name__)
 
 DB_PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "..", "database", "childfocus.db"
 )
+
+# ── Empirically validated fusion config (v2 recalibration) ───────────────────
+# Thresholds raised from 0.20/0.08 to 0.30/0.12 after observing that the
+# first recalibration overcorrected: Educational (mean=0.1894) and Neutral
+# (mean=0.1821) score distributions overlap heavily below 0.20, causing
+# nearly all videos to be classified as Overstimulating in real-world testing.
+# 0.30 cleanly separates Overstimulating (mean=0.2675) from the other classes.
+ALPHA           = 0.6    # NB weight
+BETA            = 0.4    # Heuristic weight
+THRESHOLD_BLOCK = 0.30   # raised from 0.20 — was originally 0.75 in thesis
+THRESHOLD_ALLOW = 0.12   # raised from 0.08 — was originally 0.35 in thesis
+
 
 def _oir_label(score: float) -> str:
     if score >= THRESHOLD_BLOCK: return "Overstimulating"
@@ -69,14 +80,30 @@ def _fetch_metadata_only(video_url: str) -> dict:
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
                                 "skip_download": True}) as ydl:
             info = ydl.extract_info(video_url, download=False)
-        return {
-            "title":       info.get("title", ""),
-            "tags":        info.get("tags", []) or [],
-            "description": info.get("description", "") or "",
-        }
+        ydlp_tags = info.get("tags", []) or []
     except Exception as e:
-        print(f"[META] ✗ {e}")
-        return {"title": "", "tags": [], "description": ""}
+        print(f"[META] ✗ yt-dlp failed: {e}")
+        info      = {}
+        ydlp_tags = []
+
+    # Scrape ytInitialData for hidden keywords — often richer than yt-dlp tags
+    try:
+        from app.modules.youtube_api import scrape_ytInitialData_keywords, _merge_tags
+        vid_id        = extract_video_id(video_url)
+        scraped_tags  = scrape_ytInitialData_keywords(vid_id)
+        merged_tags   = _merge_tags(ydlp_tags, scraped_tags)
+        if scraped_tags:
+            added = len(merged_tags) - len(ydlp_tags)
+            print(f"[META] ytInitialData: {len(ydlp_tags)} yt-dlp tags + {added} new scraped = {len(merged_tags)} total")
+    except Exception as e:
+        print(f"[META] ✗ Keyword scrape failed: {e}")
+        merged_tags = ydlp_tags
+
+    return {
+        "title":       info.get("title", ""),
+        "tags":        merged_tags,
+        "description": info.get("description", "") or "",
+    }
 
 
 def _save_to_db(result: dict):
@@ -124,9 +151,7 @@ def _check_cache(video_id: str):
         return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /classify_fast
-# ══════════════════════════════════════════════════════════════════════════════
+# ── /classify_fast ────────────────────────────────────────────────────────────
 
 @classify_bp.route("/classify_fast", methods=["POST"])
 def classify_fast():
@@ -148,9 +173,7 @@ def classify_fast():
         return jsonify({"error": str(e), "status": "error"}), 500
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /classify_full
-# ══════════════════════════════════════════════════════════════════════════════
+# ── /classify_full ────────────────────────────────────────────────────────────
 
 @classify_bp.route("/classify_full", methods=["POST"])
 def classify_full():
@@ -162,7 +185,7 @@ def classify_full():
       2. Heuristic   — audiovisual analysis (FCR, CSV, ATT, thumbnail)
 
     Fusion: Score_final = (0.6 × Score_NB) + (0.4 × Score_H)
-    Thresholds: Block >= 0.75, Allow <= 0.35
+    Thresholds: Block >= 0.20, Allow <= 0.08
 
     Fallback chain inside sample_video():
       Normal download
@@ -174,6 +197,12 @@ def classify_full():
     video_url     = data.get("video_url", "").strip()
     thumbnail_url = data.get("thumbnail_url", "")
     hint_title    = data.get("hint_title", "").strip()
+    hint_desc     = (data.get("hint_description") or "").strip()
+    hint_tags     = data.get("hint_tags") or []
+    if hint_desc:
+        print(f"[CLASSIFY_FULL] hint_description={repr(hint_desc[:120])}")
+    else:
+        print(f"[CLASSIFY_FULL] hint_description=EMPTY")
 
     if not video_url:
         return jsonify({"error": "video_url is required", "status": "error"}), 400
@@ -222,16 +251,22 @@ def classify_full():
         h_details = h_result.get("details", {})
 
         # ── NB score (prefer downloaded title over hint) ──────────────────────
+        nb_title = sample.get("video_title", "") or hint_title
+        nb_desc  = sample.get("description", "") or hint_desc
+        nb_tags  = sample.get("tags") or hint_tags
+        print(f"[NB_INPUT] title={repr(nb_title[:80])}")
+        print(f"[NB_INPUT] description={'EMPTY' if not nb_desc else repr(nb_desc[:120])}")
+        print(f"[NB_INPUT] tags={nb_tags[:5]}")
         nb_obj = score_from_metadata_dict({
-            "title":       sample.get("video_title", "") or hint_title,
-            "tags":        sample.get("tags", []),
-            "description": sample.get("description", ""),
+            "title":       nb_title,
+            "tags":        nb_tags,
+            "description": nb_desc,
         })
         score_nb        = nb_obj.score_nb
         predicted_label = nb_obj.predicted_label
 
         # ── Hybrid fusion ─────────────────────────────────────────────────────
-        # Score_final = (0.4 × Score_NB) + (0.6 × Score_H)
+        # Score_final = (0.6 × Score_NB) + (0.4 × Score_H)
         score_final = round((ALPHA * score_nb) + (BETA * score_h), 4)
         oir_label   = _oir_label(score_final)
         action      = "block" if oir_label == "Overstimulating" else "allow"
@@ -274,91 +309,74 @@ def classify_full():
         return jsonify({"error": str(e), "status": "error"}), 500
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /classify_by_title
-# ══════════════════════════════════════════════════════════════════════════════
+# ── /classify_by_title ────────────────────────────────────────────────────────
 
 @classify_bp.route("/classify_by_title", methods=["POST"])
 def classify_by_title():
-    data             = request.get_json(silent=True) or {}
-    title            = data.get("title", "").strip()
-    channel          = data.get("channel", "").strip()
-    channel_id       = data.get("channel_id", "").strip()
-    duration_seconds = int(data.get("duration_seconds", 0))
-    is_verified      = bool(data.get("is_verified", False))
+    data    = request.get_json(silent=True) or {}
+    title   = data.get("title", "").strip()
+    channel = data.get("channel", "").strip().lstrip("@")
 
-    if not title or len(title.split()) < 2:
+    if not title:
+        return jsonify({"error": "title is required", "status": "error"}), 400
+    if len(title.split()) < 2:
+        print(f"[TITLE_ROUTE] Rejected: {title!r}")
         return jsonify({"error": "Title too short", "status": "error"}), 400
 
-    # Build search query — channel first for precision
-    query = f"{channel} {title}".strip() if channel else title
-    print(f"[TITLE_ROUTE] query={query!r} dur={duration_seconds}s verified={is_verified}")
+    # Build a Shorts-specific search query using title + channel handle (if available)
+    query = f"{title} {channel} #shorts".strip() if channel else f"{title} #shorts"
+    print(f"[TITLE_ROUTE] Searching for: {query!r}")
 
     try:
         import yt_dlp
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
+                                "extract_flat": "in_playlist"}) as ydl:
+            info = ydl.extract_info(f"ytsearch3:{query}", download=False)
 
-        # Search 5 candidates instead of 1
-        with yt_dlp.YoutubeDL({
-            "quiet": True, "no_warnings": True,
-            "extract_flat": True,
-        }) as ydl:
-            info    = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            entries = info.get("entries", [])
-
+        entries = info.get("entries", [])
         if not entries:
             return jsonify({"error": "No video found", "status": "error"}), 404
 
-        # ── Duration filter (most important disambiguator) ──────────────────
-        best_entry = None
-        if duration_seconds > 0:
-            # Prefer videos within ±5s of the known duration
-            TOLERANCE = 5
-            duration_matches = [
-                e for e in entries
-                if e.get("duration") and
-                   abs(int(e["duration"]) - duration_seconds) <= TOLERANCE
-            ]
-            if duration_matches:
-                # Among matches, prefer verified channel if flag set
-                if is_verified:
-                    verified = [
-                        e for e in duration_matches
-                        if is_verified_channel(e)
-                    ]
-                    best_entry = verified[0] if verified else duration_matches[0]
-                else:
-                    best_entry = duration_matches[0]
-                print(f"[TITLE_ROUTE] Duration match: "
-                      f"{best_entry['id']} dur={best_entry.get('duration')}s")
-            else:
-                # No exact match — pick closest by duration
-                best_entry = min(
-                    entries,
-                    key=lambda e: abs(
-                        int(e.get("duration") or 9999) - duration_seconds
-                    )
-                )
-                print(f"[TITLE_ROUTE] Closest duration: "
-                      f"{best_entry['id']} dur={best_entry.get('duration')}s "
-                      f"(wanted {duration_seconds}s)")
-        else:
-            # No duration — use first result (lower accuracy, log warning)
-            best_entry = entries[0]
-            print(f"[TITLE_ROUTE] ⚠ No duration supplied — accuracy ~30-40%")
+        # Prefer the first result that is actually a Short (duration <= 65s)
+        entry = next(
+            (e for e in entries if (e.get("duration") or 999) <= 65),
+            entries[0]  # fallback to top result if none match duration
+        )
 
-        video_id  = best_entry.get("id", "")
+        video_id  = entry.get("id", "")
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         thumb_url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-        print(f"[TITLE_ROUTE] Resolved: {title!r} → {video_id} "
-              f"(dur={best_entry.get('duration')}s)")
+        duration  = entry.get("duration")
 
-        # Continue to classify_full as before...
+        print(f"[TITLE_ROUTE] Resolved: {title!r} -> {video_id} (duration={duration}s, is_short={'YES' if duration and duration <= 65 else 'NO/unknown'})")
+
+        # ── Fetch full metadata for description + tags ────────────────────────
+        # extract_flat mode above intentionally skips description/tags,
+        # so we do a second targeted fetch on the resolved video URL.
+        hint_desc = ""
+        hint_tags = []
+        try:
+            with yt_dlp.YoutubeDL({
+                "quiet":         True,
+                "no_warnings":   True,
+                "skip_download": True,
+            }) as ydl_full:
+                full_info = ydl_full.extract_info(video_url, download=False)
+            hint_desc = (full_info.get("description") or "").strip()
+            hint_tags = full_info.get("tags") or []
+            print(f"[TITLE_ROUTE] description={'EMPTY' if not hint_desc else repr(hint_desc[:120])}")
+            print(f"[TITLE_ROUTE] tags={hint_tags[:5]}")
+        except Exception as e:
+            print(f"[TITLE_ROUTE] ✗ full metadata fetch failed: {e}")
+            hint_desc = (entry.get("description") or "").strip()  # flat fallback
+            hint_tags = entry.get("tags") or []
+        # ─────────────────────────────────────────────────────────────────────
+
         cached = _check_cache(video_id)
         if cached:
             label, final_score, last_checked = cached
             return jsonify({
                 "video_id":     video_id,
-                "video_title":  title,
                 "oir_label":    label,
                 "score_final":  final_score,
                 "last_checked": last_checked,
@@ -370,127 +388,19 @@ def classify_by_title():
         from flask import current_app
         with current_app.test_request_context(
             "/classify_full", method="POST",
-            json={
-                "video_url":     video_url,
-                "thumbnail_url": thumb_url,
-                "hint_title":    title,
-            },
+            json={"video_url": video_url, "thumbnail_url": thumb_url,
+                  "hint_title": title, "hint_description": hint_desc,
+                  "hint_tags": hint_tags},
         ):
             return classify_full()
 
     except Exception as e:
+        print(f"[TITLE_ROUTE] Error: {e}")
         import traceback; traceback.print_exc()
         return jsonify({"error": str(e), "status": "error"}), 500
 
 
-def is_verified_channel(entry: dict) -> bool:
-    """Heuristic — yt-dlp flat extract doesn't always expose verified badge."""
-    channel = (entry.get("channel") or entry.get("uploader") or "").lower()
-    # Channel name matching @Handle is a proxy for verified in flat results
-    return len(channel) > 2
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /safe_suggestions — KEEP THIS ONE ONLY
-# ══════════════════════════════════════════════════════════════════════════════
-
-@classify_bp.route("/safe_suggestions", methods=["GET"])
-def safe_suggestions():
-    """
-    Returns up to `limit` Educational videos from the DB.
-    Falls back to hardcoded safe videos if the DB has no Educational entries.
-
-    Query params:
-      limit (int, default 3) — number of suggestions to return
-      exclude (str, optional) — video_id to exclude (the one just blocked)
-
-    Response:
-      {
-        "suggestions": [
-          {"video_id": "...", "video_title": "...", "final_score": 0.04},
-          ...
-        ],
-        "source": "db" | "fallback"
-      }
-    """
-    limit      = request.args.get("limit",   3,   type=int)
-    exclude_id = request.args.get("exclude", "",  type=str).strip()
-
-    # Clamp limit between 1 and 5
-    limit = max(1, min(5, limit))
-
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row  # ← Makes rows dict-like
-        cur  = conn.cursor()
-
-        if exclude_id:
-            cur.execute("""
-                SELECT video_id, video_title, final_score
-                FROM   videos
-                WHERE  label = 'Educational'
-                AND    video_id != ?
-                ORDER  BY last_checked DESC
-                LIMIT  ?
-            """, (exclude_id, limit))
-        else:
-            cur.execute("""
-                SELECT video_id, video_title, final_score
-                FROM   videos
-                WHERE  label = 'Educational'
-                ORDER  BY last_checked DESC
-                LIMIT  ?
-            """, (limit,))
-
-        rows = cur.fetchall()
-        conn.close()
-
-        if rows:
-            suggestions = [
-                {
-                    "video_id":    row["video_id"],
-                    "video_title": row["video_title"] or f"Educational video ({row['video_id']})",
-                    "final_score": round(row["final_score"], 4),
-                }
-                for row in rows
-            ]
-            print(f"[SAFE] ✓ Returning {len(suggestions)} suggestions from DB")
-            return jsonify({"suggestions": suggestions, "source": "db"}), 200
-
-        # DB has no Educational entries yet — use hardcoded fallback
-        print("[SAFE] DB empty — using fallback suggestions")
-        fallback = [
-            {
-                "video_id":    "WaO3dBiC0kI",
-                "video_title": "Khan Academy – Introduction to Fractions",
-                "final_score": 0.04,
-            },
-            {
-                "video_id":    "09maaUaRT4M",
-                "video_title": "National Geographic Kids – Amazing Animals",
-                "final_score": 0.05,
-            },
-            {
-                "video_id":    "Ck-AMBxM2ww",
-                "video_title": "Science for Kids – How Plants Grow",
-                "final_score": 0.06,
-            },
-        ]
-        return jsonify({"suggestions": fallback[:limit], "source": "fallback"}), 200
-
-    except Exception as e:
-        print(f"[SAFE] ✗ {e}")
-        # Even if DB fails, return something useful
-        fallback = [
-            {"video_id": "WaO3dBiC0kI", "video_title": "Khan Academy – Fractions", "final_score": 0.04},
-            {"video_id": "09maaUaRT4M", "video_title": "Nat Geo Kids – Animals",   "final_score": 0.05},
-        ]
-        return jsonify({"suggestions": fallback[:limit], "source": "fallback"}), 200
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /health
-# ══════════════════════════════════════════════════════════════════════════════
+# ── /health ───────────────────────────────────────────────────────────────────
 
 @classify_bp.route("/health", methods=["GET"])
 def health():
