@@ -2,7 +2,7 @@
 nixPkgs = ["ffmpeg", "nodejs", "python313", "python313Packages.pip"]
 
 [phases.install]
-cmds = ["pip3 install -r requirements.txt"]
+cmds = ["pip3 install -r requirements.txt --no-cache-dir"]
 
 [start]
-cmd = "gunicorn run:app"
+cmd = "gunicorn run:app -w 2 -b 0.0.0.0:$PORT --timeout 120"
